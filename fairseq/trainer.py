@@ -16,7 +16,7 @@ from itertools import chain
 import torch
 
 from fairseq import distributed_utils, optim, utils
-from fairseq.meters import AverageMeter, TimeMeter
+from fairseq.meters import AverageMeter, StopwatchMeter, TimeMeter
 from fairseq.optim import lr_scheduler
 
 
@@ -54,6 +54,7 @@ class Trainer(object):
         self.meters['clip'] = AverageMeter()   # % of updates clipped
         self.meters['oom'] = AverageMeter()    # out of memory
         self.meters['wall'] = TimeMeter()      # wall time in seconds
+        self.meters['train_wall'] = StopwatchMeter()  # train wall time in seconds
 
         self._buffered_stats = defaultdict(lambda: [])
         self._flat_grads = None
@@ -80,37 +81,52 @@ class Trainer(object):
                 self.lr_scheduler, self._num_updates, self._optim_history, extra_state,
             )
 
-    def load_checkpoint(self, filename):
+    def load_checkpoint(self, filename, reset_optimizer=False, reset_lr_scheduler=False, optimizer_overrides=None):
         """Load all training state from a checkpoint file."""
         extra_state, self._optim_history, last_optim_state = \
             utils.load_model_state(filename, self.model)
 
-        if last_optim_state is not None:
+        if last_optim_state is not None and not reset_optimizer:
             # rebuild optimizer after loading model, since params may have changed
             self._build_optimizer()
 
             # only reload optimizer and lr_scheduler if they match
             last_optim = self._optim_history[-1]
-            if last_optim['criterion_name'] == self.criterion.__class__.__name__:
+
+            assert last_optim['criterion_name'] == self.criterion.__class__.__name__, \
+                'criterion does not match; please reset the optimizer (--reset-optimizer)'
+
+            assert last_optim['optimizer_name'] == self.optimizer.__class__.__name__, \
+                'optimizer does not match; please reset the optimizer (--reset-optimizer)'
+
+            if not reset_lr_scheduler:
                 self.lr_scheduler.load_state_dict(last_optim['lr_scheduler_state'])
-                if last_optim['optimizer_name'] == self.optimizer.__class__.__name__:
-                    self.optimizer.load_state_dict(last_optim_state)
+
+            self.optimizer.load_state_dict(last_optim_state, optimizer_overrides)
 
             self._num_updates = last_optim['num_updates']
 
         if extra_state is not None and 'train_meters' in extra_state:
-            self.meters = extra_state['train_meters']
+            self.meters.update(extra_state['train_meters'])
             del extra_state['train_meters']
+
+            # reset TimeMeters, since their start times don't make sense anymore
+            for meter in self.meters.values():
+                if isinstance(meter, TimeMeter):
+                    meter.reset()
 
         return extra_state
 
-    def train_step(self, sample, update_params=True):
+    def train_step(self, sample, update_params=True, dummy_batch=False):
         """Do forward, backward and parameter update."""
         # Set seed based on args.seed and the update number so that we get
         # reproducible results when resuming from checkpoints
         seed = self.args.seed + self.get_num_updates()
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
+
+        if not dummy_batch:
+            self.meters['train_wall'].start()
 
         # forward and backward pass
         sample = self._prepare_sample(sample)
@@ -125,64 +141,72 @@ class Trainer(object):
 
         # update parameters
         if update_params:
-            # gather logging outputs from all replicas
-            sample_sizes = self._buffered_stats['sample_sizes']
-            logging_outputs = self._buffered_stats['logging_outputs']
-            ooms_fwd = self._buffered_stats['ooms_fwd']
-            ooms_bwd = self._buffered_stats['ooms_bwd']
-            if self.args.distributed_world_size > 1:
-                sample_sizes, logging_outputs, ooms_fwd, ooms_bwd = map(
-                    lambda l: list(chain.from_iterable(l)),
-                    zip(*distributed_utils.all_gather_list(
-                        (sample_sizes, logging_outputs, ooms_fwd, ooms_bwd)
-                    ))
-                )
-            ooms_fwd = sum(ooms_fwd)
-            ooms_bwd = sum(ooms_bwd)
-
-            # aggregate stats and logging outputs
-            ntokens = sum(log.get('ntokens', 0) for log in logging_outputs)
-            nsentences = sum(log.get('nsentences', 0) for log in logging_outputs)
-            agg_logging_output = self.criterion.__class__.aggregate_logging_outputs(logging_outputs)
-            grad_denom = self.criterion.__class__.grad_denom(sample_sizes)
-
-            try:
-                # all-reduce and rescale gradients, then take an optimization step
-                grad_norm = self._all_reduce_and_rescale(grad_denom)
-                self._opt()
-
-                # update meters
-                self.meters['wps'].update(ntokens)
-                self.meters['ups'].update(1.)
-                self.meters['wpb'].update(ntokens)
-                self.meters['bsz'].update(nsentences)
-                if grad_norm is not None:
-                    self.meters['gnorm'].update(grad_norm)
-                    self.meters['clip'].update(1. if grad_norm > self.args.clip_norm else 0.)
-                self.meters['oom'].update(ooms_fwd + ooms_bwd)
-
-                # update loss meters for training
-                if 'loss' in agg_logging_output:
-                    self.meters['train_loss'].update(agg_logging_output['loss'], grad_denom)
-                # criterions can optionally log the NLL loss too
-                if 'nll_loss' in agg_logging_output:
-                    self.meters['train_nll_loss'].update(agg_logging_output['nll_loss'], ntokens)
-            except OverflowError as e:
-                self.zero_grad()
-                print('| WARNING: overflow detected, ' + str(e))
-
-            self.clear_buffered_stats()
-
-            return agg_logging_output
+            agg_logging_output = self._update_params()
         else:
-            return None  # buffering updates
+            agg_logging_output = None  # buffering updates
+
+        if not dummy_batch:
+            self.meters['train_wall'].stop()
+
+        return agg_logging_output
+
+    def _update_params(self):
+        # gather logging outputs from all replicas
+        sample_sizes = self._buffered_stats['sample_sizes']
+        logging_outputs = self._buffered_stats['logging_outputs']
+        ooms_fwd = self._buffered_stats['ooms_fwd']
+        ooms_bwd = self._buffered_stats['ooms_bwd']
+        if self.args.distributed_world_size > 1:
+            sample_sizes, logging_outputs, ooms_fwd, ooms_bwd = map(
+                lambda l: list(chain.from_iterable(l)),
+                zip(*distributed_utils.all_gather_list(
+                    (sample_sizes, logging_outputs, ooms_fwd, ooms_bwd)
+                ))
+            )
+        ooms_fwd = sum(ooms_fwd)
+        ooms_bwd = sum(ooms_bwd)
+
+        if ooms_fwd == self.args.distributed_world_size:
+            print('| WARNING: OOM in all workers, skipping batch')
+            self.zero_grad()
+            return None
+
+        # aggregate stats and logging outputs
+        ntokens = sum(log.get('ntokens', 0) for log in logging_outputs)
+        nsentences = sum(log.get('nsentences', 0) for log in logging_outputs)
+        agg_logging_output = self.criterion.__class__.aggregate_logging_outputs(logging_outputs)
+        grad_denom = self.criterion.__class__.grad_denom(sample_sizes)
+
+        try:
+            # all-reduce and rescale gradients, then take an optimization step
+            grad_norm = self._all_reduce_and_rescale(grad_denom)
+            self._opt()
+
+            # update meters
+            self.meters['wps'].update(ntokens)
+            self.meters['ups'].update(1.)
+            self.meters['wpb'].update(ntokens)
+            self.meters['bsz'].update(nsentences)
+            if grad_norm is not None:
+                self.meters['gnorm'].update(grad_norm)
+                self.meters['clip'].update(1. if grad_norm > self.args.clip_norm else 0.)
+            self.meters['oom'].update(ooms_fwd + ooms_bwd)
+
+            # update loss meters for training
+            if 'loss' in agg_logging_output:
+                self.meters['train_loss'].update(agg_logging_output['loss'], grad_denom)
+            # criterions can optionally log the NLL loss too
+            if 'nll_loss' in agg_logging_output:
+                self.meters['train_nll_loss'].update(agg_logging_output['nll_loss'], ntokens)
+        except OverflowError as e:
+            self.zero_grad()
+            print('| WARNING: overflow detected, ' + str(e))
+
+        self.clear_buffered_stats()
+
+        return agg_logging_output
 
     def _forward(self, sample, eval=False):
-        # prepare model and optimizer
-        if eval:
-            self.model.eval()
-        else:
-            self.model.train()
         loss = None
         sample_size = 0
         logging_output = {
@@ -190,19 +214,25 @@ class Trainer(object):
             'nsentences': sample['target'].size(0) if sample is not None else 0,
         }
         oom = 0
-        if sample is not None:
-            try:
+        try:
+            # prepare model and optimizer
+            if eval:
+                self.model.eval()
+            else:
+                self.model.train()
+
+            if sample is not None:
                 with torch.no_grad() if eval else contextlib.ExitStack():
                     # calculate loss and sample size
                     loss, sample_size, logging_output_ = self.task.get_loss(self.model, self.criterion, sample)
                     logging_output.update(logging_output_)
-            except RuntimeError as e:
-                if not eval and 'out of memory' in str(e):
-                    print('| WARNING: ran out of memory, skipping batch')
-                    oom = 1
-                    loss = None
-                else:
-                    raise e
+        except RuntimeError as e:
+            if not eval and 'out of memory' in str(e):
+                print('| WARNING: ran out of memory, skipping batch')
+                oom = 1
+                loss = None
+            else:
+                raise e
         return loss, sample_size, logging_output, oom
 
     def _backward(self, loss):
@@ -241,9 +271,11 @@ class Trainer(object):
             if not p.requires_grad:
                 continue
             if p.grad is None:
-                raise RuntimeError('Model parameter did not receive gradient: ' + name + '. '
-                                   'Use the param in the forward pass or set requires_grad=False')
-            grads.append(p.grad.data)
+                print('WARNING: model parameter did not receive gradient: ' + name + '. '
+                      'Check that you\'re using the param in the forward pass or set requires_grad=False')
+                grads.append(p.new_zeros(p.shape))
+            else:
+                grads.append(p.grad.data)
         return grads
 
     def _get_flat_grads(self, out=None):
@@ -307,7 +339,7 @@ class Trainer(object):
 
     def dummy_train_step(self, dummy_batch):
         """Dummy training step for warming caching allocator."""
-        self.train_step(dummy_batch, update_params=False)
+        self.train_step(dummy_batch, update_params=False, dummy_batch=True)
         self.zero_grad()
         self.clear_buffered_stats()
 
